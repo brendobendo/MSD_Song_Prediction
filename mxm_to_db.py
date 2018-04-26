@@ -60,7 +60,7 @@ def die_with_usage():
     sys.exit(0)
 
 
-def buildDB():
+if __name__ == '__main__':
 
     # help menu
     if len(sys.argv) < 4:

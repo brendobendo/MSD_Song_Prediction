@@ -5,12 +5,12 @@ Created on Wed Apr 25 00:00:30 2018
 
 @author: babraham
 """
-
 import sqlite3
 import os
 import numpy as np
 from tqdm import tqdm
 import time
+import pickle
 
 class sqldb():
     def __init__(self, fpath):
@@ -28,7 +28,7 @@ class sqldb():
         return self.query("pragma table_info('{}')".format(table))
     
     def showTables(self):
-        tnames = self.tableNames()
+        tnames = self.getTableNames()
         for tname in tnames:
             print('----------{}----------'.format(tname))
             schema = self.getSchema(tname)
@@ -94,14 +94,86 @@ class mxmdb(sqldb):
     def getTFs(self):
         return self.query('SELECT word, SUM(count) from lyrics group by word')
     
+def buildSongMetaData(mxm):
+    fname = 'unique_tracks.txt'
+    with open(fname, 'r') as f:
+        lines = f.readlines()
+    clean_lines = []
+    for l in lines:
+        l = l.strip().replace("'","")
+        clean_lines.append(l.split('<SEP>'))
+    
+    mxm.query('create table trackdata(track_id TEXT primary key, song_id TEXT, song_name TEXT, artist TEXT)')
+    for i,(tid, sid, art, nm) in enumerate(tqdm(clean_lines)):
+        #print('{},{},{}'.format(i,nm,art))
+        mxm.query("insert into trackdata values('{}','{}','{}','{}')".format(tid,sid,nm,art))
+    
 class userdb(sqldb):
     def __init__(self, fpath='userdata.db'):
         sqldb.__init__(self, fpath)
         self.fpath = fpath
-        
+        print('getting users...')
+        self.users = self.get_users()
+        print('counting records...')
+        self.N = self.query('select count(*) from userdata')
+        self.N = self.N[0][0]
+        self.user_dists = {}
+        self.get_songPool()
+    
+    def get_users(self):
+        res = self.query('select distinct user_id from userdata')
+        return [r[0] for r in res]
+    
+    def get_songPool(self):
+        with open('overlapping_songs.txt', 'r') as f:
+            lines = f.readlines()
+        self.valid_songs = set([l.strip() for l in lines])
+    
+    def get_user_dists(self):
+        for user in self.users:
+            rows = self.query("select * from userdata where user_id = '{}'".format(user))
+            uids,sids,counts = zip(*rows)
+            if len(set(sids).intersection(self.valid_songs) > 10):
+                del(rows)
+                for uid, sid, count in zip(uids,sids,counts):
+                    self.user_dists[uid][sid] = self.user_dsits[uid].get(sid,0) + count
+    
+def get_user_dists(db, batch_size = 128):
+    num_batches = db.N / batch_size
+    for n in tqdm(range(num_batches-1)):
+        start, end = batch_size*n+1, batch_size*(n+1)+1
+        if n == num_batches-1:
+            rows = db.query('select * from userdata where rowid > {}'.format(start))
+        else:
+            rowrange = ', '.join([str(i) for i in range(start,end)])
+            rows = db.query("select * from userdata where rowid in ({})".format(rowrange)) 
+        for r in rows:
+            uid, sid, count = r
+            if uid not in db.user_dists: db.user_dists[uid] = {}
+            db.user_dists[uid][sid] = db.user_dists[uid].get(sid,0) + count
 
+    return db
 
+def filter_users(db, n):
+    filt_tups = []
+    for k,v in db.user_dists.items():
+        if len(set(v).intersection(db.valid_songs)) > n:
+            filt_tups.append((k,v))
+    return dict(filt_tups)
 
+# =============================================================================
+# Sensitivity Analysis for valid song ct. threshold
+# 10,  641070
+# 20,  372354
+# 30,  247736
+# 50, 127193
+# 100 34397
+# 175 8275
+# 250 2690    
+# 500 144
+# 1000 1
+# =============================================================================
+    
 def buildUserDB(outfilename):
     #initialize database
     conn = sqlite3.connect(outfilename)
@@ -125,12 +197,14 @@ def buildUserDB(outfilename):
     conn.commit()
     conn.close()           
         
-        
-
-    
-#useful sqlite commands
-#db.c.execute("SELECT name FROM sqlite_master WHERE type='table';")
-#pragma table_info('lyrics') 
 def calcTFIDF(db, tf,df, norm_tf=True):
     if norm_tf: tf = 1 + np.log(tf+1)
     return tf * np.log(1 + float(db.N) / df)   
+
+def save_obj(obj, obj_name):
+    with open('{}.pkl'.format(obj_name), 'w') as out:
+        pickle.dump(obj, out)
+        
+def load_obj(obj_name):
+    f = open('{}.pkl'.format(obj_name), 'r')
+    return pickle.load(f)

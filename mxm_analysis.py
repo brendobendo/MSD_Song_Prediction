@@ -95,10 +95,9 @@ class xmxdb(sqldb):
         return self.query('SELECT word, SUM(count) from lyrics group by word')
     
 class userdb(sqldb):
-    def __init__(self, fpath='train_triplets.txt'):
+    def __init__(self, fpath='userdata.db'):
         sqldb.__init__(self, fpath)
         self.fpath = fpath
-        self.buildDB()
         
 
 
@@ -108,7 +107,7 @@ def buildUserDB(outfilename):
     conn = sqlite3.connect(outfilename)
     c = conn.cursor()
     # create user data table
-    q = "CREATE TABLE userdata (user_id TEXT PRIMARY KEY,"
+    q = "CREATE TABLE userdata (user_id TEXT,"
     q += "song_id INT,"
     q += " count INT);"
     conn.execute(q)
@@ -123,6 +122,7 @@ def buildUserDB(outfilename):
         user, song, playct = l.strip().split("\t")
         q = "INSERT INTO userdata VALUES('{}','{}','{}')".format(user,song,playct)
         c.execute(q)
+    conn.commit()
     conn.close()           
         
         

@@ -41,9 +41,9 @@ class sqldb():
         if timeit: print('query took {} seconds.'.format(dt))
         return res.fetchall()
     
-class xmxdb(sqldb):
-    def __init__(self,xmxpath='xmxdb.db'):
-        sqldb.__init__(self, xmxpath)
+class mxmdb(sqldb):
+    def __init__(self,mxmpath='mxmdb.db'):
+        sqldb.__init__(self, mxmpath)
         self.mxm_tables = ['words', 'lyrics']
         print('building vocab...')
         self.vocab = self.getVocab()

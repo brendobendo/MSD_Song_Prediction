@@ -51,6 +51,8 @@ class mxmdb(sqldb):
         self.N = self.query('select count(distinct track_id) from lyrics', timeit=True)
         self.N = self.N[0][0]
         self.tfidf = {k:{'tf':0,'df':0,'tfidf':0} for k in self.vocab}
+        trackSongTups = self.query('select song_id, track_id from trackdata')
+        self.songToTrack = {t[0]:t[1] for t in trackSongTups}
                  
     def getSongs(self):
         songs = self.query('SELECT distinct track_id from lyrics;')
@@ -118,7 +120,7 @@ class userdb(sqldb):
         self.N = self.query('select count(*) from userdata')
         self.N = self.N[0][0]
         self.user_dists = {}
-        self.get_songPool()
+        #self.get_songPool()
     
     def get_users(self):
         res = self.query('select distinct user_id from userdata')
@@ -143,10 +145,10 @@ def get_user_dists(db, batch_size = 128):
     for n in tqdm(range(num_batches-1)):
         start, end = batch_size*n+1, batch_size*(n+1)+1
         if n == num_batches-1:
-            rows = db.query('select * from userdata where rowid > {}'.format(start))
+            rows = db.query('select * from userdata_sub where rowid > {}'.format(start))
         else:
             rowrange = ', '.join([str(i) for i in range(start,end)])
-            rows = db.query("select * from userdata where rowid in ({})".format(rowrange)) 
+            rows = db.query("select * from userdata_sub where rowid in ({})".format(rowrange)) 
         for r in rows:
             uid, sid, count = r
             if uid not in db.user_dists: db.user_dists[uid] = {}
@@ -154,13 +156,45 @@ def get_user_dists(db, batch_size = 128):
 
     return db
 
-def filter_users(db, n):
+def sparse_cos_sim(d1,d2):
+    common_keys = set(d1.keys()).intersection(set(d2.keys()))
+    num = 0
+    for k in common_keys: num += d1[k]*d2[k]
+    denom = np.linalg.norm(d1.values()) * np.linalg.norm(d2.values())
+    return float(num) / denom
+    
+
+
+def filter_users(db, n, songlist=None):
     filt_tups = []
-    for k,v in db.user_dists.items():
-        if len(set(v).intersection(db.valid_songs)) > n:
+    if not songlist: songlist = db.valid_songs
+    songlist = set(songlist)
+    for k,v in tqdm(db.user_dists.items()):
+        if len(set(v.keys()).intersection(songlist)) > n:
             filt_tups.append((k,v))
     return dict(filt_tups)
 
+def buildSongVocabs(songdb, songlist=None):
+    if not songlist: songlist = songdb.getSongs()
+    vocabs = {s:{} for s in songlist}
+    songlist = set(songlist)
+    print('pulling data from db...')
+    rows = songdb.query('select song_id, word, count from lyrics')
+    for sid, word, ct in tqdm(rows):
+        if sid in songlist:
+            vocabs[sid][word] = vocabs[sid].get(word,0) + ct
+    return vocabs
+        
+    
+    
+def buildUserVocab(userdict, songdict):
+    uservocabs = {k:{} for k in userdict.keys()}
+    for user, songs in tqdm(userdict.items()):
+        for song in songs:
+            for k,count in songdict[song].items():
+                uservocabs[user][k] = uservocabs[user].get(k,0) + count
+    return uservocabs
+        
 # =============================================================================
 # Sensitivity Analysis for valid song ct. threshold
 # 10,  641070
@@ -196,7 +230,13 @@ def buildUserDB(outfilename):
         c.execute(q)
     conn.commit()
     conn.close()           
-        
+
+
+songstr = ', '.join(["'{}'".format(s) for s in final_songs])
+udb.query("insert into userdata_sub select * from userdata where song_id in ({})".format(songstr))
+
+trackstr = ', '.join(["'{}'".format(t) for t in final_overlap])
+mxm.query("insert into lyrics_sub select * from lyrics where track_id in ({})".format(trackstr))
 def calcTFIDF(db, tf,df, norm_tf=True):
     if norm_tf: tf = 1 + np.log(tf+1)
     return tf * np.log(1 + float(db.N) / df)   
@@ -208,3 +248,23 @@ def save_obj(obj, obj_name):
 def load_obj(obj_name):
     f = open('{}.pkl'.format(obj_name), 'r')
     return pickle.load(f)
+
+def buildTagDB(outfilename):
+    conn = sqlite3.connect(outfilename)
+    c = conn.cursor()
+    # create user data table
+    q = "CREATE TABLE tagdata (user_id TEXT,"
+    q += "song_id INT,"
+    q += " count INT);"
+    conn.execute(q)
+    
+samp = [(1, 1, 100.0), (1, 2, 100.0), (2, 3, 100.0), (2, 4, 100.0), (3, 5, 100.0)]  
+print '************** DEMO 2 **************'
+print 'We get all tracks with at least one tag'
+sql = "SELECT tid FROM tids"
+res = conn.execute(sql)
+data = res.fetchall()
+for k in range(10):
+    print data[k]
+print '...'
+print '(total number of track IDs: %d)' % len(data)

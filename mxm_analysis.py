@@ -12,7 +12,51 @@ from tqdm import tqdm
 import time
 import pickle
 import pandas as pd
+from nltk.corpus import stopwords
+import re
 
+#===========Global Params====================#
+#taglist = load_obj('top_40k_tags_df_100k_users')
+
+# =============================================================================
+# #Steps for pre-processing
+# 1. load songlist
+# 2. build mxmdb
+# 2. build song vocab
+# 2.5 build/read in tfidf
+# 3. build userdb
+# 4. build user distributions
+# 5. build user vocabs
+# 7. build tag db
+# 8. build trackTags
+# 8.5 build database container - encapsulates everythign
+# 9. build userTags
+# 10 read in eval data
+# 11 build vocab_knn
+# 12 build tag knn
+# =============================================================================
+def getData():
+    songlist = load_obj('overlapping_songs')
+    mxm = mxmdb()
+    mxm.tfidf = load_obj('tfidf')
+    print('building song vocab...')
+    mxm.sv = buildSongVocabs(mxm, songlist)
+    udb = userdb()
+    print('building user listening distributionser...')
+    udb.users = udb.users[:100000]
+    udb.get_user_dists()
+    print('building user vocab...')
+    udb.uv = buildUserVocabs(mxm,udb.user_dists, mxm.sv, tfidf=True)
+    tdb = tagdb()
+    print('making song tags...')
+    tdb.buildTrackTags()
+    dbc = db_container(mxm,udb,tdb)
+    print('making user tags...')
+    dbc = buildUserTags(dbc)
+    print('getting eval data...')
+    Eval = getEvalData()
+    return [mxm,udb,tdb,dbc,Eval]
+#============Generic DB - all databases inherit from this class==============#
 class sqldb():
     def __init__(self, fpath):
         self.fpath = fpath
@@ -41,7 +85,34 @@ class sqldb():
         dt = time.time()-ti
         if timeit: print('query took {} seconds.'.format(dt))
         return res.fetchall()
-    
+
+#=======================DB Container to store all other dbs===============#
+class db_container(sqldb):
+    def __init__(self, songdb, userdb, tagdb):
+        self.tdb = tagdb
+        self.mxm = songdb
+        self.udb = userdb
+        self.stt = self.mxm.songToTrack
+        self.tts = self.mxm.trackToSong
+        self.vocab = self.mxm.vocab
+        self.uhistory = self.udb.user_dists
+        self.taglist = load_obj('top_40k_tags_df_100k_users')
+        self.idToWord = load_obj('idToWord')
+        self.wordToId = load_obj('wordToId')
+        
+    def buildUserTags(self):
+        userTags = {}
+        for user, history in tqdm(self.uhistory.items()):
+            if user not in userTags:
+                userTags[user] = {}
+            for i, (song,count) in enumerate(history.items()):
+                track = self.stt[song]
+                try:
+                    tags = self.tdb.trackTags[track]
+                    for t in tags: userTags[user][t] = userTags[user].get(t, 0) + count
+                except: print('error finding tags for track {}'.format(track))
+        self.userTags = userTags
+#====================Song Code============================================#    
 class mxmdb(sqldb):
     def __init__(self,mxmpath='mxmdb.db'):
         sqldb.__init__(self, mxmpath)
@@ -51,11 +122,12 @@ class mxmdb(sqldb):
         print('counting songs...')
         self.N = self.query('select count(distinct track_id) from lyrics', timeit=True)
         self.N = self.N[0][0]
-        #self.tfidf = {k:{'tf':0,'df':0,'tfidf':0} for k in self.vocab}
-        self.tfidf = pd.read_csv('Features/tfidf.csv')
-        self.tfidf = self.tfidf.set_index('word')
+        self.tfidf = {k:{'tf':0,'df':0,'tfidf':0} for k in self.vocab}
         trackSongTups = self.query('select song_id, track_id from trackdata')
         self.songToTrack = {t[0]:t[1] for t in trackSongTups}
+        self.trackToSong = {v:k for k,v in self.songToTrack.items()}
+        self.stopwords = set(stopwords.words('english'))
+        self.vocab = set(self.vocab).difference(self.stopwords)
                  
     def getSongs(self):
         songs = self.query('SELECT distinct track_id from lyrics;')
@@ -101,11 +173,33 @@ class mxmdb(sqldb):
     
     def getSongInfo(self, song_id, tid=None):
         if not tid: tid = self.songToTrack[song_id]
-        res = self.query("select song_name, song_artist from trackdata where track_id = '{}'".format(tid))
+        res = self.query("select song_name, artist from trackdata where track_id = '{}'".format(tid))
         if len(res) == 0:
             print ("couldn't find any songs matching id {}".format(song_id))
             return
         else: return res[0]
+             
+def getSongInfo(mxm, song_id, tid=None):
+    if not tid: tid = mxm.songToTrack[song_id]
+    res = mxm.query("select song_name, artist from trackdata where track_id = '{}'".format(tid))
+    if len(res) == 0:
+        print ("couldn't find any songs matching id {}".format(song_id))
+        return
+    else: return res[0]
+    
+def buildSongVocabs(songdb, songlist=None):
+    global stopwords
+    if not songlist: songlist = songdb.getSongs()
+    vocabs = {s:{} for s in songlist}
+    songlist = set(songlist)
+    print('pulling data from db...')
+    rows = songdb.query('select song_id, word, count from lyrics')
+    for sid, word, ct in tqdm(rows):
+        if sid in songlist:
+            if word not in songdb.stopwords:
+                vocabs[sid][word] = vocabs[sid].get(word,0) + ct
+    return vocabs
+                        
 def buildSongMetaData(mxm):
     fname = 'unique_tracks.txt'
     with open(fname, 'r') as f:
@@ -119,13 +213,61 @@ def buildSongMetaData(mxm):
     for i,(tid, sid, art, nm) in enumerate(tqdm(clean_lines)):
         #print('{},{},{}'.format(i,nm,art))
         mxm.query("insert into trackdata values('{}','{}','{}','{}')".format(tid,sid,nm,art))
+        
+#====================Code to get raw lyrics=================================#        
+def get_ldf_hashes(mxm, trackstr):
+    ldf = pd.read_csv('ldf_all.csv')
+    sdf = mxm.query('select * from trackdata where track_id in ({})'.format(trackstr))
+    sdf = pd.DataFrame(sdf, columns = ['track_id','song_id','title','artist'])
+    titles, artists = sdf.title.tolist(), sdf.artist.tolist()
+    titles = [t.lower() for t in titles]
+    titles = [re.sub('\(.*?\)','',t) for t in titles]
+    titles = [t.strip() for t in titles]
+    artists = [a.lower() for a in artists]
+    hash_ = [artist+'|'+title for artist,title in zip(artists,titles)]
+    sdf['hash'] = hash_
+    sdf['title'] = titles
+    sdf['artist'] = artists
+    ldf_hash = ldf['hash'].tolist()
+    sdf_hash = hash_
+    res = set(sdf_hash).intersection(ldf_hash)
+    return res
     
+
+
+#====================Artist Functions============================#
+
+def fixSongArtistColumns(mxm):
+    mxm.query('create table trackdata_tmp (track_id TEXT, song_id TEXT, artist TEXT, song_name TEXT)')
+    mxm.query('insert into trackdata_tmp (track_id, song_id, artist, song_name) select track_id, song_id, artist, song_name from trackdata')
+    mxm.query('drop table trackdata')
+    mxm.query('alter table trackdata_tmp rename to trackdata')
+    mxm.showTables()
+    mxm.query('select artist from trackdata limit 5')
+    mxm.conn.commit()
+
+def getSongToArtist(mxm, udb):
+    songToArtist = mxm.query('select song_id, artist from trackdata')
+    user_artists = {}
+    for user, songs in tqdm(udb.user_dists.items()):
+        if user not in user_artists:
+            user_artists[user] = {}
+        for song, ct in songs.items():
+            artist = songToArtist[song]
+            if artist not in user_artists[user]:
+                user_artists[user][artist] = ct
+            else:
+                user_artists[user][artist] += ct    
+    return dict(songToArtist)
+
+          
+#====================User Functions============================#
 class userdb(sqldb):
     def __init__(self, fpath='userdata.db'):
         sqldb.__init__(self, fpath)
         self.fpath = fpath
         print('getting users...')
-        self.users = self.get_users()
+        self.users = set(self.get_users())
         print('counting records...')
         self.N = self.query('select count(*) from userdata')
         self.N = self.N[0][0]
@@ -139,125 +281,59 @@ class userdb(sqldb):
     def get_songPool(self):
         with open('overlapping_songs.txt', 'r') as f:
             lines = f.readlines()
-        self.valid_songs = set([l.strip() for l in lines])
+        self.valid_songs = set([l.strip() for l in lines])  
     
-    def get_user_dists(self):
-        for user in self.users:
-            rows = self.query("select * from userdata where user_id = '{}'".format(user))
-            uids,sids,counts = zip(*rows)
-            if len(set(sids).intersection(self.valid_songs) > 10):
-                del(rows)
-                for uid, sid, count in zip(uids,sids,counts):
-                    self.user_dists[uid][sid] = self.user_dsits[uid].get(sid,0) + count
-    
-def get_user_dists(db, batch_size = 128, sample=False):
-    num_batches = db.N / batch_size
-    for n in tqdm(range(num_batches-1)):
-        start, end = batch_size*n+1, batch_size*(n+1)+1
-        if n == num_batches-1:
-            rows = db.query('select * from userdata_sub where rowid > {}'.format(start))
-        else:
-            rowrange = ', '.join([str(i) for i in range(start,end)])
-            rows = db.query("select * from userdata_sub where rowid in ({})".format(rowrange)) 
-        for r in rows:
-            uid, sid, count = r
-            if not sample:
-                if uid not in db.user_dists: db.user_dists[uid] = {}
-                db.user_dists[uid][sid] = db.user_dists[uid].get(sid,0) + count
+    def get_user_dists(self, batch_size = 128, sample=False, songList = None):
+        num_batches = self.N / batch_size
+        if songList: songList = set(songList)
+        for n in tqdm(range(num_batches-1)):
+            start, end = batch_size*n+1, batch_size*(n+1)+1
+            if n == num_batches-1:
+                rows = self.query('select * from userdata_sub where rowid > {}'.format(start))
             else:
-                if uid in db.usamp:
-                    if uid not in db.user_dists:
-                        db.user_dists[uid] = {}
-                    db.user_dists[uid][sid] = db.user_dists[uid].get(sid,0) + count
-
-    return db
-
-def sparse_cos_sim(d1,d2):
-    common_keys = set(d1.keys()).intersection(set(d2.keys()))
-    num = 0
-    for k in common_keys: num += d1[k]*d2[k]
-    denom = np.linalg.norm(d1.values()) * np.linalg.norm(d2.values())
-    return float(num) / denom
-    
-def knn(user,userdict,k=3):
-    v1 = userdict.pop(user)
-    sims = [(u, sparse_cos_sim(v1,v2)) for u,v2 in tqdm(userdict.items())]
-    sims = sorted(sims, key=lambda x:x[1], reverse=True)
-    return sims[:k]
-
-def filter_users(db, n, songlist=None):
-    filt_tups = []
-    if not songlist: songlist = db.valid_songs
-    songlist = set(songlist)
-    for k,v in tqdm(db.user_dists.items()):
-        if len(set(v.keys()).intersection(songlist)) > n:
-            filt_tups.append((k,v))
-    return dict(filt_tups)
-
-def buildSongVocabs(songdb, songlist=None):
-    if not songlist: songlist = songdb.getSongs()
-    vocabs = {s:{} for s in songlist}
-    songlist = set(songlist)
-    print('pulling data from db...')
-    rows = songdb.query('select track_id, word, count from lyrics')
-    for sid, word, ct in tqdm(rows):
-        if sid in songlist:
-            vocabs[sid][word] = vocabs[sid].get(word,0) + ct
-    return vocabs
-        
-def getEvalData():
-    visible = open('EvalData/year1_test_triplets_visible.txt', 'r').readlines()
-    visible = [v.strip().split('\t') for v in visible]
-    vdict,hdict = {}, {}
-    for user,song,ct in visible:
-        if user not in vdict:
-            vdict[user] = {}
-        vdict[user][song] = vdict[user].get(song,0) + int(ct)
-            
-    hidden = open('EvalData/year1_test_triplets_hidden.txt', 'r').readlines()
-    hidden = [h.strip().split('\t') for h in hidden]
-    for user,song,ct in hidden:
-        if user not in hdict:
-            hdict[user] = {}
-        hdict[user][song] = hdict[user].get(song,0) + int(ct)
-    return {'visible':vdict,'hidden':hdict}
-    
-    
+                rowrange = ', '.join([str(i) for i in range(start,end)])
+                rows = self.query("select * from userdata_sub where rowid in ({})".format(rowrange)) 
+            for r in rows:                    
+                uid, sid, count = r
+                if uid in self.users:
+                    if not sample:
+                        if uid not in self.user_dists: self.user_dists[uid] = {}
+                        if songList:
+                            if sid in songList:  self.user_dists[uid][sid] = self.user_dists[uid].get(sid,0) + count
+                        else: self.user_dists[uid][sid] = self.user_dists[uid].get(sid,0) + count
+                    else:
+                        if uid in self.usamp:
+                            if uid not in self.user_dists:
+                                self.user_dists[uid] = {}
+                            if songList:
+                                if sid in songList: self.user_dists[uid][sid] = self.user_dists[uid].get(sid,0) + count
+                            else: self.user_dists[uid][sid] = self.user_dists[uid].get(sid,0) + count
+                        
 def buildUserVocabs(mxm, userdict, songdict, tfidf = True):
     uservocabs = {k:{} for k in userdict.keys()}
     for user, songs in tqdm(userdict.items()):
-        for song, ct in songs.items():
-            track = mxm.songToTrack[song]
-            sdict = songdict.get(track,None)
-            if sdict is not None:
-                for k,count in sdict.items():
-                    uservocabs[user][k] = uservocabs[user].get(k,0) + count
-    if tfidf:
-        for user,vocab in tqdm(uservocabs.items()):
-            for i,(v, tf) in enumerate(vocab.items()):
-                try:
-                    df = mxm.tfidf[v]['df']
-                    tfidf = calcTFIDF(mxm,tf,df)
-                    uservocabs[user][v] = tfidf
-                except:
-                    print('error finding df for word for user {} at idx {}'.format(user,i))
-                    pass
-
+        uservocabs[user] = buildUserVocab(mxm,user,songs,songdict,tfidf)
     return uservocabs
+
+def buildUserVocab(mxm, user, usersongs, songdict, tfidf=True):
+    vocab = {}
+    for song, ct in usersongs.items():      
+        sdict = songdict.get(song,None)
+        if sdict is not None:
+            #if song in songdict:
+            for gram,count in sdict.items():
+                vocab[gram] = vocab.get(gram,0) + count
+    if tfidf:
+        for i,(v,tf) in enumerate(vocab.items()):
+            try:
+                df = mxm.tfidf[v]['df']
+                tfidf = calcTFIDF(mxm,tf,df)
+                vocab[v] = tfidf
+            except:
+                print('error finding df for word for user {} at idx {}'.format(user,i))
+                pass
+    return vocab
         
-# =============================================================================
-# Sensitivity Analysis for valid song ct. threshold
-# 10,  641070
-# 20,  372354
-# 30,  247736
-# 50, 127193
-# 100 34397
-# 175 8275
-# 250 2690    
-# 500 144
-# 1000 1
-# =============================================================================
-    
 def buildUserDB(outfilename):
     #initialize database
     conn = sqlite3.connect(outfilename)
@@ -279,14 +355,285 @@ def buildUserDB(outfilename):
         q = "INSERT INTO userdata VALUES('{}','{}','{}')".format(user,song,playct)
         c.execute(q)
     conn.commit()
-    conn.close()           
+    conn.close()      
 
-#
-#songstr = ', '.join(["'{}'".format(s) for s in final_songs])
+def filter_users(db, n, songlist=None):
+    filt_tups = []
+    if not songlist: songlist = db.valid_songs
+    songlist = set(songlist)
+    for k,v in tqdm(db.user_dists.items()):
+        if len(set(v.keys()).intersection(songlist)) > n:
+            filt_tups.append((k,v))
+    return dict(filt_tups)
+  
+#================Tag Functions=============================================#
+
+class tagdb(sqldb):
+    def __init__(self, fpath="lastfm_tags.db", trackList = None):
+        self.fpath = fpath
+        sqldb.__init__(self,fpath)
+        tags = self.query('select * from tags')
+        self.tags = {t[0]:i for i,t in enumerate(tags) if len(t[0]) > 0}
+        tids = self.query('select * from tids')
+        self.tracks = {t[0]:i for i,t in enumerate(tids) if len(t[0]) > 0}
+        self.idToTag = [t[0] for t in sorted(self.tags.items(), key = lambda x:x[1])]
+        self.idToTrack = [t[0] for t in sorted(self.tracks.items(), key = lambda x:x[1])]
+        self.tracklist = set(trackList) if trackList else None
+
+    def buildTrackTags(self):
+        if self.tracklist:
+            self.trackTags = {k:[] for k in list(self.tracklist)}
+        else:
+            self.trackTags = {k:[] for k in self.tracks.keys()}
+        trips = self.query('select * from tid_tag')
+        for tid, tagid, value in tqdm(trips):      
+            try:
+                track = self.idToTrack[tid]
+                if tagid <= len(self.idToTag):
+                    if self.tracklist:
+                        if track in self.tracklist:
+                            tag = self.idToTag[tagid]
+                            self.trackTags[track].append(tag)
+                    else:
+                         tag = self.idToTag[tagid]
+                         self.trackTags[track].append(tag)   
+            except: print('error reading tagid {}'.format(tagid))               
+    
+    def getUserTags(self, trackHistory):
+        userTags = {}
+        for i, (track,count) in enumerate(trackHistory.items()):
+            try:
+                tags = self.trackTags[track]
+                for t in tags: userTags[t] = userTags.get(t, 0) + count
+            except: print('error finding tags for track {}'.format(track))
+        return userTags
+
+
+
+
+#===================User Vector Conversion Methods========================# 
+def getUserVec2(dbc, user, getY=False):
+    user_vec = np.zeros(len(dbc.vocab)+len(dbc.taglist), dtype=int)
+    usr_vocab = dbc.udb.uv[user]
+    for v,ct in usr_vocab.items():
+        user_vec[dbc.wordToId[v]] += ct
+    usr_tags = dbc.userTags[user]
+    for t,ct in usr_tags.items():
+        if t in dbc.taglist:
+            user_vec[dbc.wordToId[t]] += ct
+    if getY:
+        user_y = {k:0 for k in dbc.mxm.sv.keys()}
+        user_lstn_cts = dbc.uhistory[user]
+        for song, ct in user_lstn_cts.items():
+            user_y[song] = user_y.get(song,0) + ct
+        return user_vec, user_y
+    else:  return user_vec
+    
+def getUserVec3(empty_vec, user,vocab,tags,wordToId):
+    user_vec = np.zeros(len(empty_vec))
+    for v,ct in vocab.items():
+        user_vec[wordToId[v]] += ct
+    for t,ct in tags.items():
+        user_vec[wordToId[t]] += ct
+    return user_vec
+
+def getCombVecs(dbc):
+    comb_vecs = {k:v for k,v in dbc.udb.uv.items()}
+    for user in comb_vecs.keys():
+        if user in dbc.userTags:
+            #print('found match')
+            tags = dbc.userTags[user]
+            for tag,ct in tags.items():
+                comb_vecs[user][tag] = comb_vecs[user].get(tag,0) + ct
+    return comb_vecs
+     
+def exportUserVecs(dbc):
+    xdict, ydict = {},{}
+    for user, history in tqdm(dbc.uhistory.items()):
+        if user in dbc.udb.uv:
+            x,y = getUserVec2(dbc,user)
+            xdict[user] = x
+            ydict[user] = y
+    xdf = pd.DataFrame.from_dict(xdict, orient="index")
+    ydf = pd.DataFrame.from_dict(ydict, orient="index")
+    xdf.to_csv('user_x.csv')
+    ydf.to_csv('user_y.csv')
+    return xdf,ydf
+#==============KNN Methods================#    
+class KNN():
+    def __init__(self, mxm_db, userhistories, uservocab, songdict, k=5, name=None):
+        self.userhistories = userhistories
+        self.uservocab = uservocab
+        self.k = k
+        self.mxm = mxm_db
+        self.songdict = songdict
+        if not name: self.name = "vocab_knn"
+        else:  self.name = name
+        
+    def find_nns(self, vocab):
+        sims = [(u, self.sparse_cos_sim(vocab,v2)) for u,v2 in tqdm(self.uservocab.items())]
+        sims = sorted(sims, key=lambda x:x[1], reverse=True)
+        return sims[:self.k]
+
+    def sparse_cos_sim(self,d1,d2):
+        common_keys = set(d1.keys()).intersection(set(d2.keys()))
+        num = 0
+        for k in common_keys: num += d1[k]*d2[k]
+        denom = np.linalg.norm(d1.values()) * np.linalg.norm(d2.values())
+        return float(num) / denom
+    
+    def recommend(self, user, history):
+        uv = buildUserVocab(self.mxm, user, history, self.songdict, tfidf=True)
+        nns = self.find_nns(vocab=uv)
+        recset = set()
+        for user, sim in nns:
+            usongs = self.userhistories[user]
+            diff = set(usongs).difference(set(history))
+            [recset.add(d) for d in list(diff)]
+        return recset
+
+
+#============================Prediction=====================================#
+ 
+def recommend(mod, user, history):
+    uv = buildUserVocab(mod.mxm, user, history, mod.songdict, tfidf=True)
+    tags = b
+    nns = mod.find_nns(vocab=uv)
+    recdict = {}
+    for user, sim in nns:
+        usongs = mod.userhistories[user]
+        diff = set(usongs).difference(set(history))
+        for d in diff:
+            recdict[d] = recdict.get(d,0) + 1
+    num_recs = len(history)
+    recs = sorted(recdict.items(), key=lambda x:x[1], reverse=True)
+    return dict(recs[:num_recs])
+       
+def makePreds(model, eval_data, outname = "model_preds.csv", export=False):
+    res = {}
+    for i, (user, history) in enumerate(eval_data['visible'].items()):
+        print('----------------{}/{}-----------------'.format(i+1,len(eval_data['visible'])))
+        recs = recommend(model,user,history)
+        hidden = eval_data['hidden'][user]
+        metrics = calcEvalMetrics(hidden, recs)
+        res[user] = metrics
+        if export:
+            if not os.path.isfile(outname):
+                out = open(outname, 'w')
+                out.write('idx,user,vocabKNN,Accuracy,Recall,RBO\n')
+            else: out = open(outname, 'a')
+            metstr = ','.join([str(m) for m in metrics])
+            out.write(','.join([str(i),user,model.name,metstr])+'\n')            
+    return res
+
+def makeRandomPreds(eval_data, songdb, udb, k=10):
+    res = {}
+    for user, history in tqdm(eval_data['visible'].items()):
+        choices = np.random.choice(udb.user_dists.keys(), size=k, replace=False)
+        recdict = {}
+        for rec_user in choices:
+            usongs = udb.user_dists[rec_user]
+            diff = set(usongs).difference(set(history))
+            for d in diff:
+                recdict[d] = recdict.get(d,0) + 1
+        num_recs = len(history)
+        recs = sorted(recdict.items(), key=lambda x:x[1], reverse=True)
+        recs = dict(recs[:num_recs])
+        hidden = eval_data['hidden'][user]
+        metrics = calcEvalMetrics(hidden,recs)
+        res[user]=metrics
+    return res
+            
+
+#=============================Evaluation====================================#
+def getEvalData():
+    visible = open('EvalData/year1_test_triplets_visible.txt', 'r').readlines()
+    visible = [v.strip().split('\t') for v in visible]
+    vdict,hdict = {}, {}
+    for user,song,ct in visible:
+        if user not in vdict:
+            vdict[user] = {}
+        vdict[user][song] = vdict[user].get(song,0) + int(ct)
+            
+    hidden = open('EvalData/year1_test_triplets_hidden.txt', 'r').readlines()
+    hidden = [h.strip().split('\t') for h in hidden]
+    for user,song,ct in hidden:
+        if user not in hdict:
+            hdict[user] = {}
+        hdict[user][song] = hdict[user].get(song,0) + int(ct)
+    return {'visible':vdict,'hidden':hdict} 
+
+
+def evaluate(model,eval_data,song_db,udb,outname="eval_results.csv", k=None, export=True):
+    all_res = {k:{'model':[], 'random':[]} for k in eval_data['visible'].keys()}
+    model_preds = makePreds(model,eval_data, export=False)
+    if not k: k = model.k
+    random_preds =  makeRandomPreds(eval_data,song_db,udb,k=k)
+    for i,user in enumerate(model_preds.keys()):
+        mres = model_preds[user]
+        pres = random_preds[user]
+        if export:
+            if not os.path.isfile(outname):
+                out = open(outname, 'w')
+                out.write('idx,user,model,Accuracy,Recall,RBO\n')
+            else: out = open(outname, 'a')
+            mod_str =','.join([str(m) for m in mres])
+            out.write(','.join([str(i),user,model.name,mod_str])+'\n') 
+            rand_str =','.join([str(m) for m in pres])
+            out.write(','.join([str(i),user,'random',rand_str])+'\n') 
+            out.close()
+        all_res[user]['model'] = mres
+        all_res[user]['random'] = pres
+    return all_res
+    
+
+def buildEvalSample(Eval,n=100):
+    users = np.random.choice(Eval['visible'].keys(), size=n, replace=False)
+    hid_sub = {u:Eval['visible'][u] for u in users.tolist()}
+    vis_sub = {u:Eval['hidden'][u] for u in users.tolist()}
+    return {'visible':vis_sub, 'hidden':hid_sub}
+
+def calcEvalMetrics(d_actual,d_pred):
+    acc = binaryAcc(d_actual.keys(), d_pred.keys())
+    recl = recall(d_actual, d_pred)
+    rbo = RBO(d_actual, d_pred)
+    return (acc, recl, rbo)
+
+def RBO(d1,d2):
+    d1 = sorted(d1.items(), key=lambda x:x[1], reverse=True)
+    d2 = sorted(d2.items(), key=lambda x:x[1], reverse=True)
+    l1 = [tup[0] for tup in d1]
+    l2 = [tup[0] for tup in d2]
+    com_len = min(len(l1),len(l2))
+    rbo = 0
+    for i in range(1,com_len):
+        common = set(l1[:i]).intersection(set(l2[:i]))
+        inc = float(len(common)) / i
+        rbo += inc
+    rbo = float(rbo) / com_len
+    return rbo
+
+def binaryAcc(l1,l2):
+    common = set(l1).intersection(set(l2))
+    com_len = min(len(l1), len(l2))
+    return float(len(common)) / com_len
+
+def recall(d_actual, d_pred):
+    found, total = 0,0
+    for song,count in d_actual.items():
+        if song in d_pred:
+            pred_count = d_pred[song]
+            found += min(count, pred_count)
+        total += count
+    return float(found) / total
+
+    
+#=======================Utilities/Data Import/Export==========================#
+#trackstr = ', '.join(["'{}'".format(s) for s in final_songs])
 #udb.query("insert into userdata_sub select * from userdata where song_id in ({})".format(songstr))
-#
-#trackstr = ', '.join(["'{}'".format(t) for t in final_overlap])
-#mxm.query("insert into lyrics_sub select * from lyrics where track_id in ({})".format(trackstr))
+
+
+
 def calcTFIDF(db, tf,df, norm_tf=True):
     if norm_tf: tf = 1 + np.log(tf+1)
     return tf * np.log(1 + float(db.N) / df)   
@@ -299,12 +646,10 @@ def load_obj(obj_name):
     f = open('{}.pkl'.format(obj_name), 'r')
     return pickle.load(f)
 
-def buildTagDB(outfilename):
-    conn = sqlite3.connect(outfilename)
-    c = conn.cursor()
-    # create user data table
-    q = "CREATE TABLE tagdata (user_id TEXT,"
-    q += "song_id INT,"
-    q += " count INT);"
-    conn.execute(q)
-    
+def sparse_cos_sim(d1,d2):
+    common_keys = set(d1.keys()).intersection(set(d2.keys()))
+    num = 0
+    for k in common_keys: num += d1[k]*d2[k]
+    denom = np.linalg.norm(d1.values()) * np.linalg.norm(d2.values())
+    return float(num) / denom      
+        

@@ -13,6 +13,8 @@ import time
 import pickle
 import pandas as pd
 from nltk.corpus import stopwords
+from nltk.sentiment.vader import SentimentIntensityAnalyzer
+from empath import Empath
 import re
 
 #===========Global Params====================#
@@ -96,7 +98,7 @@ class db_container(sqldb):
         self.tts = self.mxm.trackToSong
         self.vocab = self.mxm.vocab
         self.uhistory = self.udb.user_dists
-        self.taglist = load_obj('top_40k_tags_df_100k_users')
+        self.taglist = load_obj('top_40k_tags_80k_users')
         self.idToWord = load_obj('idToWord')
         self.wordToId = load_obj('wordToId')
         
@@ -322,7 +324,8 @@ def buildUserVocab(mxm, user, usersongs, songdict, tfidf=True):
         if sdict is not None:
             #if song in songdict:
             for gram,count in sdict.items():
-                vocab[gram] = vocab.get(gram,0) + count
+                if gram in mxm.vocab:
+                    vocab[gram] = vocab.get(gram,0) + count
     if tfidf:
         for i,(v,tf) in enumerate(vocab.items()):
             try:
@@ -333,7 +336,22 @@ def buildUserVocab(mxm, user, usersongs, songdict, tfidf=True):
                 print('error finding df for word for user {} at idx {}'.format(user,i))
                 pass
     return vocab
-        
+
+def filter_vocab(n,mxm):
+    tfidf = sorted(mxm.tfidf.items(), key= lambda x: x[1]['df'], reverse=True)
+    tfidf = tfidf[:n]
+    mxm.vocab = set([t[0] for t in tfidf])
+    return mxm
+
+def splitStats(n, mxm, met='tfidf'):
+    tfidf = sorted(mxm.tfidf.items(), key= lambda x: x[1][met], reverse=True)
+    tfidf = tfidf[:n]
+    v_ct = sum([v['df'] for v in dict(tfidf).values()])
+    v_ct_old = sum([v['df'] for v in mxm.tfidf.values()])
+    t_ct = sum([v['tf'] for v in dict(tfidf).values()])
+    t_ct_old = sum([v['tf'] for v in mxm.tfidf.values()])
+    return{'dprop': float(v_ct) / v_ct_old, 'tprop': float(t_ct) / t_ct_old}
+       
 def buildUserDB(outfilename):
     #initialize database
     conn = sqlite3.connect(outfilename)
@@ -408,8 +426,13 @@ class tagdb(sqldb):
             except: print('error finding tags for track {}'.format(track))
         return userTags
 
-
-
+def getAllUserTags(mxm,udb,tdb):
+    userTags = {}
+    for user, history in tqdm(udb.user_dists.items()):
+        history = {mxm.songToTrack[s]:v for s,v in history.items()}
+        tags = tdb.getUserTags(history)
+        userTags[user] = tags
+    return userTags
 
 #===================User Vector Conversion Methods========================# 
 def getUserVec2(dbc, user, getY=False):
@@ -492,12 +515,21 @@ class KNN():
             [recset.add(d) for d in list(diff)]
         return recset
 
-
+import scipy.sparse as sp
+d = {0: [0,1], 1: [1,2,3], 
+     2: [3,4,5], 3: [4,5,6], 
+     4: [5,6,7], 5: [7], 
+     6: [7,8,9]}
+row_ind = [k for k, v in d.items() for _ in range(len(v))]
+col_ind = [i for ids in d.values() for i in ids]
+X = sp.csr_matrix(([1]*len(row_ind), (row_ind, col_ind))) 
 #============================Prediction=====================================#
  
-def recommend(mod, user, history):
-    uv = buildUserVocab(mod.mxm, user, history, mod.songdict, tfidf=True)
-    tags = b
+def recommend(mod, user, history, typ="content"):
+    if typ=="content":
+        uv = buildUserVocab(mod.mxm, user, history, mod.songdict, tfidf=True)
+        #tags = b
+    else: uv = history
     nns = mod.find_nns(vocab=uv)
     recdict = {}
     for user, sim in nns:
@@ -508,12 +540,14 @@ def recommend(mod, user, history):
     num_recs = len(history)
     recs = sorted(recdict.items(), key=lambda x:x[1], reverse=True)
     return dict(recs[:num_recs])
+
+
        
-def makePreds(model, eval_data, outname = "model_preds.csv", export=False):
+def makePreds(model, eval_data, outname = "model_preds.csv", export=False, typ="content"):
     res = {}
     for i, (user, history) in enumerate(eval_data['visible'].items()):
         print('----------------{}/{}-----------------'.format(i+1,len(eval_data['visible'])))
-        recs = recommend(model,user,history)
+        recs = recommend(model,user,history, typ=typ)
         hidden = eval_data['hidden'][user]
         metrics = calcEvalMetrics(hidden, recs)
         res[user] = metrics
@@ -545,6 +579,61 @@ def makeRandomPreds(eval_data, songdb, udb, k=10):
     return res
             
 
+#==========================Sentiment Analysis===============================#
+def getSongSentiments():
+    sid = SentimentIntensityAnalyzer()
+    ldf = pd.read_csv('ldf_all_final.csv')
+    docs = [str(x) for x in ldf.lyrics]
+    sentiment_scores = [sid.polarity_scores(x) for x in tqdm(docs)]
+    song_ids = ldf['song_id'].tolist()
+    song_sents = {k:v for k,v in zip(song_ids, sentiment_scores)}
+    return song_sents
+
+def getUserSentiments(userDict, song_sents):
+    user_sents = {k:{} for k in userDict.keys()}
+    for user, songs in userDict.items():
+        sent_avgs = getUserSentiment(songs, song_sents)
+        user_sents[user] = sent_avgs
+    return user_sents
+
+def getUserSentiment(history, song_sents):
+    sent_types = song_sents.values()[0].keys()
+    sent_dict = {s:[] for s in sent_types}
+    for song, ct in history.items():
+        sent_vals = song_sents[song]
+        [sent_dict[k].append(ct*v) for k,v in sent_vals.items()]
+    tot_ct = sum(history.values())
+    sent_avgs = {k:(sum(sent_dict[k])/tot_ct) for k in sent_dict.keys()}
+    return sent_avgs
+#=====================Empath SCores========================================#
+def getSongEmpaths(from_file = True):
+    if from_file: return load_obj('song_empaths')
+    else:
+        ldf = pd.read_csv('ldf_all_final.csv')
+        lexicon = Empath()
+        docs = [str(x) for x in ldf.lyrics]
+        cat_scores = [lexicon.analyze(x, normalize = True) for x in tqdm(docs)]
+        song_ids = ldf['song_id'].tolist()
+        song_scores = {k:v for k,v in zip(song_ids, cat_scores)}
+    return song_scores
+
+def getUserEmpaths(userDict, song_empaths):
+    user_empaths = {k:{} for k in userDict.keys()}
+    for user, songs in tqdm(userDict.items()):
+        cat_avgs = getUserEmpath(songs, song_empaths)
+        user_empaths[user] = cat_avgs
+    return user_empaths   
+            
+def getUserEmpath(history, song_empaths):
+    cat_types = song_empaths.values()[0].keys()
+    cat_dict = {s:[] for s in cat_types}
+    for song, ct in history.items():
+        cat_vals = song_empaths[song]
+        [cat_dict[k].append(ct*v) for k,v in cat_vals.items()]
+    tot_ct = sum(history.values())
+    cat_avgs = {k:(sum(cat_dict[k])/tot_ct) for k in cat_dict.keys()}
+    return cat_avgs
+
 #=============================Evaluation====================================#
 def getEvalData():
     visible = open('EvalData/year1_test_triplets_visible.txt', 'r').readlines()
@@ -564,9 +653,9 @@ def getEvalData():
     return {'visible':vdict,'hidden':hdict} 
 
 
-def evaluate(model,eval_data,song_db,udb,outname="eval_results.csv", k=None, export=True):
+def evaluate(model,eval_data,song_db,udb,outname="eval_results.csv", k=None, export=True, typ="content"):
     all_res = {k:{'model':[], 'random':[]} for k in eval_data['visible'].keys()}
-    model_preds = makePreds(model,eval_data, export=False)
+    model_preds = makePreds(model,eval_data, export=False, typ=typ)
     if not k: k = model.k
     random_preds =  makeRandomPreds(eval_data,song_db,udb,k=k)
     for i,user in enumerate(model_preds.keys()):
